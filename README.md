@@ -25,8 +25,8 @@ a handover or a tunnel.
 | | Data back after |
 |---|---|
 | mu300-linux watchdog only | 68 s |
-| mu300-train 0.1 (polling every 5 s) | 13–17 s (4 runs) |
-| mu300-train, reacting to the modem's announcements | 11.7–13.8 s (5 runs) |
+| mu300-train, first version (polling every 5 s, never released) | 13–17 s (4 runs) |
+| mu300-train v0.1.0 (reacts to the modem's announcements) | 11.7–13.8 s (5 runs) |
 
 The drop is noticed and the redial started within about 2 s. The rest is mu300-linux's own dial: every AT command on
 OpenWrt costs about a second (mu300-atd waits whole seconds there), and a dial needs about ten of them.
