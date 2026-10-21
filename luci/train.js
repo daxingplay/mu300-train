@@ -39,16 +39,17 @@ return view.extend({
 		});
 	},
 
+	/* value: true/false for the switches, a number of seconds for the interval */
 	set: function(btn, key, value) {
 		var self = this;
 		if (btn) M.busy(btn, true);
-		return callSet(key, value ? '1' : '0').then(function(r) {
+		return callSet(key, typeof value === 'number' ? String(value) : value ? '1' : '0').then(function(r) {
 			if (btn) M.busy(btn, false);
 			if (!r || r.ok !== 1) {
 				M.toast(_('Failed: %s').format(M.errText(r)), { type: 'error', timeout: 6000 });
 				return self.reload();
 			}
-			M.toast(_('Saved, applying...'), { type: 'success' });
+			M.toast(key === 'interval' ? _('Saved') : _('Saved, applying...'), { type: 'success' });
 			/* the background sync takes its lock a moment after the answer */
 			setTimeout(function() { self.reload(); }, 800);
 		}, function() {
@@ -73,6 +74,17 @@ return view.extend({
 		return sel;
 	},
 
+	/* the backup check's interval: the loop takes a new value at its next check, no radio restart */
+	interval: function(current) {
+		var self = this;
+		var sel = E('select', { 'class': 'cbi-input-select', 'id': 'mud-train-interval' }, [ 5, 10, 15, 30, 60 ].map(function(n) {
+			return E('option', { 'value': String(n) }, [ _('Every %d s').format(n) ]);
+		}));
+		sel.value = String(current);
+		sel.addEventListener('change', function() { self.set(null, 'interval', +sel.value); });
+		return sel;
+	},
+
 	paint: function(st) {
 		var self = this;
 		this.busy = !!st.busy;
@@ -84,7 +96,7 @@ return view.extend({
 		var mode = st.busy ? dash : (MODES[st.mode] || st.mode || _('No answer'));
 		if (st.mode_owned && st.prev_mode)
 			mode += ' ' + _('(set by train mode, was %s)').format(MODES[st.prev_mode] || st.prev_mode);
-		var loop = st.loop ? _('Running, checks every %d s').format(st.interval || 5) : _('Not running');
+		var loop = st.loop ? _('Running: reacts to the modem at once, backup check every %d s').format(st.interval || 15) : _('Not running');
 
 		var main = E('button', { 'class': 'mud-btn' + (on ? ' warn' : ''), 'id': 'mud-train-toggle',
 			'disabled': st.busy ? '' : null }, [ on ? _('Turn train mode off') : _('Turn train mode on') ]);
@@ -106,8 +118,11 @@ return view.extend({
 			E('div', { 'class': 'mud-note' }, _('These apply while train mode is on.')),
 			this.row(_('High-speed-rail setting (5G)'), this.option('hsr', st.hsr, 'mud-train-hsr', st.busy)),
 			this.row(_('4G only'), this.option('lte_only', st.lte_only, 'mud-train-lte', st.busy)),
+			this.row(_('Backup check'), this.interval(st.interval || 15)),
 			E('div', { 'class': 'mud-note' },
-				_('4G only avoids constant 5G handovers on routes where 5G keeps dropping. It uses the Network locks setting and puts back the previous mode when it is turned off.'))
+				_('4G only avoids constant 5G handovers on routes where 5G keeps dropping. It uses the Network locks setting and puts back the previous mode when it is turned off.')),
+			E('div', { 'class': 'mud-note' },
+				_('A dropped connection is redialled the moment the modem announces it. The backup check catches what is never announced, such as a modem that stopped answering. Each check sends a few AT commands that other pages have to wait for, so shorter is not better.'))
 		]);
 
 		var ev = (st.events || []).slice().reverse();
