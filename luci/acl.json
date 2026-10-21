@@ -1,0 +1,11 @@
+{
+	"luci-app-mu300-train": {
+		"description": "Train mode (mu300-train add-on)",
+		"read": {
+			"ubus": { "mu300train": [ "get" ] }
+		},
+		"write": {
+			"ubus": { "mu300train": [ "set" ] }
+		}
+	}
+}

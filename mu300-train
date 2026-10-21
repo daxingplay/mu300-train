@@ -1,0 +1,385 @@
+#!/bin/sh
+# High-speed train mode for mu300-linux OpenWrt (ZTE F50 / MU300). A standalone add-on: it lives in /etc/mu300/train
+# and is started from /etc/rc.local, the parts of the system an mu300-linux update keeps.
+#   mu300-train on | off      switch train mode
+#   mu300-train lte on|off    4G only while train mode is on (default off)
+#   mu300-train hsr on|off    the modem's HSR setting while train mode is on (default on)
+#   mu300-train status [N]    what is on, the modem's state, the loop, its last N events (events.log)
+#   mu300-train install       put the command and the LuCI page in place, create the config, add the rc.local line
+#   mu300-train uninstall     train mode off, and undo install (the files in /etc/mu300/train stay)
+#   mu300-train boot          (rc.local) re-install the links and the LuCI page, then sync
+#   mu300-train sync          bring the modem and the loop in line with the config (what on/off/lte/hsr end with)
+#   mu300-train ui KEY VALUE  (LuCI) set enabled|lte_only|hsr to 0|1 and sync in the background
+#   mu300-train json          the state as JSON (LuCI)
+#   mu300-train daemon        the fast reconnect loop itself (started by sync)
+#
+# HSR: Unisoc's own switch, from the stock firmware's EngineerMode (HighSpeedRailImpl): AT+SP5GCMDS="set nr param",35,N
+# and read back with AT+SP5GCMDS="get nr synch_param",44 (4th field). It is an NR parameter. EngineerMode reboots after
+# setting it, so a change here is followed by a radio restart (mobile-data suspend off + resume, ~15 s without data).
+# Measured 2026-10-21: the value survives that restart and a reboot.
+#
+# 4G only: done through the panel's own network lock (/usr/libexec/unisoc-modem/lock apply mode 4g), so the Network
+# locks page shows it, its boot replay keeps it across reboots, and nothing here fights it. The mode the modem had
+# before is kept in the config (prev_mode) and put back when 4G only or train mode goes off - unless somebody changed
+# the lock in between (then theirs stays).
+#
+# The loop: the stock watchdog (mobile-data watch) looks every 30 s and redials after two bad looks, and a drop costs
+# a minute or more before the dial even starts. On a train the bearer drops many times an hour. This loop looks every
+# few seconds and redials (ifup wan, the same path the watchdog takes) as soon as the modem is registered again. It
+# never dials while a dial runs, while the data is switched off by hand or while mu300-power holds the modem down, and
+# it backs off when dials keep failing. The stock watchdog keeps running underneath.
+# Measured 2026-10-21 (AT+CGACT=0,1 while registered): back in 13-17 s, against 68 s with the stock watchdog alone.
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
+HOME_DIR=/etc/mu300/train
+SELF=$HOME_DIR/mu300-train
+LINK=/usr/bin/mu300-train
+PIDFILE=/run/mu300-train.pid
+SYNCLOCK=/run/mu300-train.sync
+UPLOCK=/run/mu300-mobile-data-up.owner
+LOCKTOOL=/usr/libexec/unisoc-modem/lock
+LOCKSTATE=/etc/unisoc-modem/lock-state.d
+WAN=wan
+IFACE=sipa_eth0
+CID=1
+RCLINE="[ -x $SELF ] && $SELF boot >/dev/null 2>&1 &   # mu300-train"
+# the LuCI page: source in $HOME_DIR/luci, copied into the system (which an update replaces) by install and boot
+LUCI_FILES="train.js:/www/luci-static/resources/view/mu300/train.js
+menu.json:/usr/share/luci/menu.d/luci-app-mu300-train.json
+acl.json:/usr/share/rpcd/acl.d/luci-app-mu300-train.json
+rpcd:/usr/libexec/rpcd/mu300train
+mu300train.zh-cn.lmo:/usr/lib/lua/luci/i18n/mu300train.zh-cn.lmo"
+# (the .lmo is built from luci/po/zh_Hans/mu300train.po with mu300-linux's tools/po2lmo.py)
+
+# Events go to a file of their own on the SD card as well: syslog is a 128 KB ring that the Wi-Fi driver's messages
+# wrap in about a minute and a half, and a trip's history should survive until it is read. Kept to 256 KB.
+EVENTS=$HOME_DIR/events.log
+log() {
+    logger -t mu300-train "$*"
+    if [ -f "$EVENTS" ] && [ "$(wc -c < "$EVENTS")" -gt 262144 ]; then
+        tail -n 1000 "$EVENTS" > "$EVENTS.new" && mv "$EVENTS.new" "$EVENTS"
+    fi
+    echo "$(date '+%F %T') up=$(cut -d' ' -f1 /proc/uptime) $*" >> "$EVENTS"
+}
+say() { log "$*"; echo "$*" >&2; }
+
+cfg() { uci -q get "mu300train.main.$1" || echo "$2"; }
+cfg_set() { uci -q set "mu300train.main.$1=$2"; uci -q commit mu300train; }
+cfg_del() { uci -q delete "mu300train.main.$1"; uci -q commit mu300train; }
+
+at() {  # at CMD [timeout]
+    mu300-at -t "${2:-6}" "$1" 2>/dev/null | tr -d '\r'
+}
+
+wait_at() {  # the AT daemon is up (boot: rc.local can run before it is)
+    n=0
+    while [ ! -p /run/mu300-at/cmd ]; do
+        n=$((n + 1)); [ "$n" -gt "${1:-120}" ] && return 1
+        sleep 1
+    done
+}
+
+hsr_get() {  # prints 0 or 1, nothing when the modem did not answer
+    at 'AT+SP5GCMDS="get nr synch_param",44' 10 |
+        awk -F'[:,]' '/^\+SP5GCMDS:/ { gsub(/ /, "", $4); print $4; exit }'
+}
+
+# hsr_set 0|1: set it when it differs. Returns 0 changed, 1 failed, 2 already so
+hsr_set() {
+    want=$1 now=$(hsr_get)
+    [ -n "$now" ] || { say "the modem did not answer the HSR query"; return 1; }
+    [ "$now" = "$want" ] && return 2
+    at "AT+SP5GCMDS=\"set nr param\",35,$want" 10 | grep -q '^OK' || { say "the modem refused AT+SP5GCMDS set nr param 35,$want"; return 1; }
+    [ "$(hsr_get)" = "$want" ] || { say "HSR read back is not $want"; return 1; }
+    say "modem HSR set to $want"
+    return 0
+}
+
+# the network mode the modem works in, as the lock tool names it (SPTESTMODE's first field, the tool's mode_pair)
+mode_now() {
+    case $(at 'AT+SPTESTMODE?' 4 | sed -n 's/^+SPTESTMODE: *\([0-9]*\).*/\1/p' | head -n1) in
+        3) echo 4g ;; 128) echo sa ;; 131) echo nsa ;; 134) echo auto ;; *) echo "" ;;
+    esac
+}
+
+mode_apply() {  # through the panel's lock tool: it saves the lock, restarts the stack and redials
+    [ -x "$LOCKTOOL" ] || { say "no $LOCKTOOL, cannot set the network mode"; return 1; }
+    "$LOCKTOOL" apply mode "$1" >/dev/null 2>&1 || { say "network mode $1 failed"; return 1; }
+    say "network mode set to $1"
+}
+
+radio_restart() {
+    if [ -s /run/mu300-mobile-data.suspend ]; then
+        say "the modem is suspended by mu300-power; the change takes effect when it resumes"
+        return 0
+    fi
+    say "restarting the radio so the change takes effect (~15 s without data)"
+    mobile-data suspend off >/dev/null 2>&1
+    mobile-data resume >/dev/null 2>&1 || say "the radio restart reported a failure; the watchdog takes over"
+}
+
+daemon_pid() {
+    p=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    [ -n "$p" ] && grep -q "mu300-train" "/proc/$p/cmdline" 2>/dev/null && echo "$p"
+}
+
+start_loop() {
+    daemon_pid >/dev/null && return 0
+    setsid "$SELF" daemon </dev/null >/dev/null 2>&1 &
+}
+
+loop_pids() {  # every running loop process, the pidfile's or not
+    for d in /proc/[0-9]*; do
+        case $(tr '\0' ' ' 2>/dev/null < "$d/cmdline") in *"mu300-train daemon"*) echo "${d#/proc/}" ;; esac
+    done
+}
+
+# stop every loop, and wait until they are gone (a loop only reacts to TERM between two checks)
+stop_loop() {
+    rm -f "$PIDFILE"
+    for p in $(loop_pids); do kill "$p" 2>/dev/null; done
+    n=0
+    while [ -n "$(loop_pids)" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n + 1)); done
+    for p in $(loop_pids); do kill -9 "$p" 2>/dev/null; done
+}
+
+sync_busy() {
+    p=$(cat "$SYNCLOCK/pid" 2>/dev/null) && [ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+# Bring the modem and the loop in line with the config. One at a time: a second caller waits for the first.
+do_sync() {
+    n=0
+    while ! mkdir "$SYNCLOCK" 2>/dev/null; do
+        sync_busy || { rm -rf "$SYNCLOCK"; continue; }
+        n=$((n + 1)); [ "$n" -gt 180 ] && { say "another sync is still running"; return 1; }
+        sleep 1
+    done
+    echo $$ > "$SYNCLOCK/pid"
+    trap 'rm -rf "$SYNCLOCK"' EXIT
+    en=$(cfg enabled 0)
+    want_hsr=0; [ "$en" = 1 ] && [ "$(cfg hsr 1)" = 1 ] && want_hsr=1
+    want_4g=0; [ "$en" = 1 ] && [ "$(cfg lte_only 0)" = 1 ] && want_4g=1
+    restart=0
+    hsr_set "$want_hsr"; [ $? = 0 ] && restart=1
+    # the mode lock restarts the stack itself, so a pending HSR change rides along with it
+    if [ "$want_4g" = 1 ]; then
+        cur=$(mode_now)
+        if [ "$cur" != 4g ]; then
+            # remember what to go back to (the first time only: a second switch must not save our own 4g)
+            [ "$(cfg mode_owned 0)" = 1 ] || cfg_set prev_mode "${cur:-auto}"
+            cfg_set mode_owned 1
+            mode_apply 4g && restart=0
+        fi
+    elif [ "$(cfg mode_owned 0)" = 1 ]; then
+        # put the old mode back, unless the lock was changed by hand since (then it is the user's)
+        saved=$(cat "$LOCKSTATE/mode" 2>/dev/null)
+        if [ -z "$saved" ] || [ "$saved" = 4g ]; then
+            mode_apply "$(cfg prev_mode auto)" && restart=0
+        else
+            say "the network lock was changed to $saved meanwhile; leaving it"
+        fi
+        cfg_del mode_owned; cfg_del prev_mode
+    fi
+    [ "$restart" = 1 ] && radio_restart
+    if [ "$en" = 1 ]; then start_loop; else stop_loop; fi
+    rm -rf "$SYNCLOCK"; trap - EXIT
+}
+
+# A dial is running: mobile-data up holds its lock (a symlink to the owner's pid), or netifd has the WAN pending
+dial_busy() {
+    o=$(readlink "$UPLOCK" 2>/dev/null) && [ -n "$o" ] && [ -d "/proc/$o" ] && return 0
+    [ "$(ifstatus "$WAN" 2>/dev/null | jsonfilter -e '@.pending' 2>/dev/null)" = true ]
+}
+
+# The bearer works: the context is active and the interface carries the context's current address (the modem may
+# re-attach by itself with a new address while sipa_eth0 keeps the old one - the stock watchdog checks the same)
+bearer_ok() {
+    at 'AT+CGACT?' 4 | grep -q "+CGACT: *$CID,1" || return 1
+    have=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+    [ -n "$have" ] || return 1
+    want=$(at "AT+CGPADDR=$CID" 4 | awk -F'[ ,"]+' '/^\+CGPADDR:/ { if (split($3, o, ".") == 4 && $3 != "0.0.0.0") print $3; exit }')
+    [ -z "$want" ] || [ "$want" = "$have" ]
+}
+
+registered() {  # +CEREG: <n>,<stat>: 1 home, 5 roaming
+    at 'AT+CEREG?' 4 | grep -qE '^\+CEREG: *[0-9],(1|5)'
+}
+
+# the pidfile names the one loop that should run: a loop that finds another pid there (or none) ends, so two
+# starts close together, or a loop left over from an upgrade, never leave two loops dialling
+own_pidfile() { [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; }
+
+daemon() {
+    echo $$ > "$PIDFILE"
+    trap 'own_pidfile && rm -f "$PIDFILE"; exit 0' INT TERM
+    interval=$(cfg interval 5)
+    backoff=0 next_dial=0 state=ok down_since=
+    log "fast reconnect loop started (every ${interval} s)"
+    while :; do
+        sleep "$interval"
+        own_pidfile || { log "another loop took over, this one ends"; exit 0; }
+        [ "$(cfg enabled 0)" = 1 ] || { log "train mode is off, loop ends"; break; }
+        [ -e /run/mu300-mobile-data-down ] && continue        # data switched off by hand
+        [ -s /run/mu300-mobile-data.suspend ] && continue     # mu300-power holds the modem down
+        [ -p /run/mu300-at/cmd ] || continue
+        sync_busy && continue                                 # a mode or HSR change restarts the radio on purpose
+        dial_busy && continue
+        if bearer_ok; then
+            if [ "$state" != ok ]; then
+                log "data back after $(( $(cut -d. -f1 /proc/uptime) - down_since )) s"
+            fi
+            state=ok backoff=0 next_dial=0
+            continue
+        fi
+        now=$(cut -d. -f1 /proc/uptime)
+        [ "$state" = ok ] && { down_since=$now; log "data lost"; }
+        if ! registered; then
+            [ "$state" != searching ] && log "no service, waiting for the modem to register"
+            state=searching
+            continue
+        fi
+        state=dialling
+        [ "$now" -lt "$next_dial" ] && continue
+        log "registered without data, redialling (ifup $WAN)"
+        ifup "$WAN"
+        # the dial needs the lock first; give it a moment so the next round sees it busy
+        sleep 2
+        # dials that keep failing while registered: 10, 20, 40, 60 s apart
+        if [ "$backoff" = 0 ]; then backoff=10; else backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60; fi
+        next_dial=$((now + backoff))
+    done
+    own_pidfile && rm -f "$PIDFILE"
+}
+
+onoff() { [ "$1" = 1 ] && echo on || echo off; }
+
+status() {
+    en=$(cfg enabled 0)
+    echo "train mode:   $(onoff "$en")$(sync_busy && echo ' (applying a change)')"
+    echo "options:      HSR $(onoff "$(cfg hsr 1)"), 4G only $(onoff "$(cfg lte_only 0)")"
+    h=$(hsr_get)
+    echo "modem HSR:    ${h:-no answer}"
+    m=$(mode_now)
+    echo "network mode: ${m:-no answer}$([ "$(cfg mode_owned 0)" = 1 ] && echo " (set by train mode, was $(cfg prev_mode auto))")"
+    if p=$(daemon_pid); then echo "fast loop:    running (pid $p, every $(cfg interval 5) s)"; else echo "fast loop:    not running"; fi
+    echo "network:      $(at 'AT+CEREG?' 4 | grep '^+CEREG')"
+    echo "wan:          $(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}')"
+    echo "last events:"
+    tail -n "${1:-10}" "$EVENTS" 2>/dev/null | sed 's/^/  /'
+}
+
+json() {  # for LuCI; no AT queries while a sync holds the radio (they would wait behind it)
+    busy=false; sync_busy && busy=true
+    loop=false; daemon_pid >/dev/null && loop=true
+    h= m=
+    [ "$busy" = false ] && { h=$(hsr_get); m=$(mode_now); }
+    printf '{"enabled":%s,"hsr":%s,"lte_only":%s,"busy":%s,"loop":%s,"modem_hsr":"%s","mode":"%s","mode_owned":%s,"prev_mode":"%s","interval":%s,"events":[' \
+        "$([ "$(cfg enabled 0)" = 1 ] && echo true || echo false)" \
+        "$([ "$(cfg hsr 1)" = 1 ] && echo true || echo false)" \
+        "$([ "$(cfg lte_only 0)" = 1 ] && echo true || echo false)" \
+        "$busy" "$loop" "$h" "$m" \
+        "$([ "$(cfg mode_owned 0)" = 1 ] && echo true || echo false)" "$(cfg prev_mode '')" "$(cfg interval 5)"
+    tail -n 30 "$EVENTS" 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g; s/.*/"&"/' | tr '\n' ',' | sed 's/,$//'
+    printf ']}\n'
+}
+
+ui() {  # ui KEY 0|1: the LuCI page's setter; answers at once, the change runs in the background
+    case $1 in enabled|lte_only|hsr) ;; *) echo '{"ok":0,"error":"unknown setting"}'; return 2 ;; esac
+    case $2 in 0|1) ;; *) echo '{"ok":0,"error":"bad value"}'; return 2 ;; esac
+    cfg_set "$1" "$2"
+    log "LuCI: $1 -> $2"
+    setsid "$SELF" sync </dev/null >/dev/null 2>&1 &
+    echo '{"ok":1}'
+}
+
+install_luci() {  # copy the page into the system; reload rpcd and drop LuCI's caches when anything changed
+    changed=0
+    # a here-document, not a pipe: the loop runs in this shell, so it can set changed
+    while IFS=: read -r src dst; do
+        [ -f "$HOME_DIR/luci/$src" ] || continue
+        cmp -s "$HOME_DIR/luci/$src" "$dst" && continue
+        mkdir -p "${dst%/*}"
+        cp "$HOME_DIR/luci/$src" "$dst"
+        case $dst in /usr/libexec/rpcd/*) chmod 755 "$dst" ;; *) chmod 644 "$dst" ;; esac
+        changed=1
+    done <<EOF
+$LUCI_FILES
+EOF
+    if [ "$changed" = 1 ]; then
+        rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+        # rpcd reads new plugins and ACL files only when it starts (a reload is not enough, measured)
+        /etc/init.d/rpcd restart >/dev/null 2>&1
+    fi
+}
+
+remove_luci() {
+    echo "$LUCI_FILES" | while IFS=: read -r src dst; do rm -f "$dst"; done
+    rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+    /etc/init.d/rpcd restart >/dev/null 2>&1
+}
+
+install_it() {
+    if [ ! -e /etc/openwrt_release ] || [ ! -x /opt/mu300/bin/mobile-data ] || [ ! -x /opt/mu300/bin/mu300-at ]; then
+        echo "this is not mu300-linux OpenWrt (no /opt/mu300/bin/mobile-data or mu300-at); nothing installed" >&2
+        exit 1
+    fi
+    [ -f /etc/config/mu300train ] || {
+        touch /etc/config/mu300train
+        uci -q set mu300train.main=train
+        uci -q set mu300train.main.enabled=0
+        uci -q set mu300train.main.hsr=1
+        uci -q set mu300train.main.lte_only=0
+        uci -q set mu300train.main.interval=5
+        uci commit mu300train
+    }
+    [ -n "$(uci -q get mu300train.main.lte_only)" ] || cfg_set lte_only 0
+    ln -sfn "$SELF" "$LINK"
+    install_luci
+    if ! grep -qF "$SELF boot" /etc/rc.local; then
+        # before the final exit 0
+        awk -v l="$RCLINE" '/^exit 0/ && !d { print l; d = 1 } { print } END { if (!d) print l }' /etc/rc.local > /etc/rc.local.new &&
+            cat /etc/rc.local.new > /etc/rc.local && rm -f /etc/rc.local.new
+    fi
+    # an upgrade: a running loop still runs the old code
+    if [ -n "$(loop_pids)" ]; then
+        stop_loop
+        [ "$(cfg enabled 0)" = 1 ] && start_loop
+    fi
+    echo "installed: $LINK, the LuCI page (Cellular > Train mode), /etc/config/mu300train, /etc/rc.local line"
+}
+
+uninstall_it() {
+    cfg_set enabled 0
+    do_sync
+    remove_luci
+    grep -vF "$SELF boot" /etc/rc.local > /etc/rc.local.new && cat /etc/rc.local.new > /etc/rc.local && rm -f /etc/rc.local.new
+    [ -L "$LINK" ] && rm -f "$LINK"
+    rm -f /etc/config/mu300train
+    echo "uninstalled; remove $HOME_DIR to delete the files"
+}
+
+boot() {
+    ln -sfn "$SELF" "$LINK"   # /usr/bin is replaced by an update
+    install_luci
+    [ "$(cfg enabled 0)" = 1 ] || exit 0
+    wait_at 180 || { log "boot: no AT daemon after 180 s"; exit 1; }
+    # the modem keeps HSR and the lock tool replays 4G only, so this is normally a check that changes nothing
+    do_sync
+}
+
+case ${1:-status} in
+    on|off) cfg_set enabled "$([ "$1" = on ] && echo 1 || echo 0)"; do_sync; say "train mode $1" ;;
+    lte|hsr)
+        key=$1; [ "$key" = lte ] && key=lte_only
+        case ${2:-} in on) cfg_set "$key" 1 ;; off) cfg_set "$key" 0 ;; *) echo "usage: mu300-train $1 on|off" >&2; exit 2 ;; esac
+        do_sync; say "$1 $2 (applies while train mode is on)" ;;
+    status) status "${2:-10}" ;;
+    sync) do_sync ;;
+    ui) ui "${2:-}" "${3:-}" ;;
+    json) json ;;
+    install) install_it ;;
+    uninstall) uninstall_it ;;
+    boot) boot ;;
+    daemon) daemon ;;
+    *) echo "usage: mu300-train on|off | lte on|off | hsr on|off | status [N] | install | uninstall" >&2; exit 2 ;;
+esac

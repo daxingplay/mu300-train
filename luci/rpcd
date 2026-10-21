@@ -1,0 +1,17 @@
+#!/bin/sh
+# rpcd plugin for the train mode page (mu300-train add-on): ubus call mu300train get | set {"key":..,"value":..}
+# Installed by /etc/mu300/train/mu300-train (install, boot), which keeps the source in /etc/mu300/train/luci.
+T=/etc/mu300/train/mu300-train
+case $1 in
+    list) echo '{"get":{},"set":{"key":"str","value":"str"}}' ;;
+    call)
+        case $2 in
+            get) "$T" json ;;
+            set)
+                read -r input
+                key=$(echo "$input" | jsonfilter -e '@.key' 2>/dev/null)
+                val=$(echo "$input" | jsonfilter -e '@.value' 2>/dev/null)
+                "$T" ui "$key" "$val" ;;
+            *) echo '{"ok":0,"error":"unknown method"}' ;;
+        esac ;;
+esac

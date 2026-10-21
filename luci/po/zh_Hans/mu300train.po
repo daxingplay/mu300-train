@@ -1,0 +1,88 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Train mode"
+msgstr "高铁模式"
+
+msgid "High-speed train mode"
+msgstr "高铁模式"
+
+msgid "For fast trains: turns on the modem's high-speed-rail setting (5G) and a reconnect check every few seconds, so mobile data comes back as soon as the modem finds the network again instead of after a minute or more. Switching restarts the radio, so data stops for 15-40 s."
+msgstr "适用于高铁等高速列车：开启调制解调器的高铁优化（5G），并每隔几秒检查一次连接。调制解调器重新找到网络后，移动数据会立即恢复，而不必等待一分钟以上。切换时会重启射频，移动数据将中断 15–40 秒。"
+
+msgid "Applying a change..."
+msgstr "正在应用更改…"
+
+msgid "On"
+msgstr "开"
+
+msgid "Off"
+msgstr "关"
+
+msgid "No answer"
+msgstr "无响应"
+
+msgid "Automatic"
+msgstr "自动"
+
+msgid "4G only"
+msgstr "仅 4G"
+
+msgid "5G SA only"
+msgstr "仅 5G SA"
+
+msgid "5G NSA"
+msgstr "5G NSA"
+
+msgid "(set by train mode, was %s)"
+msgstr "（由高铁模式设置，原为%s）"
+
+msgid "Running, checks every %d s"
+msgstr "运行中，每 %d 秒检查一次"
+
+msgid "Not running"
+msgstr "未运行"
+
+msgid "Turn train mode on"
+msgstr "开启高铁模式"
+
+msgid "Turn train mode off"
+msgstr "关闭高铁模式"
+
+msgid "Modem HSR setting"
+msgstr "调制解调器高铁优化"
+
+msgid "Network mode"
+msgstr "网络模式"
+
+msgid "Fast reconnect"
+msgstr "快速重连"
+
+msgid "Options"
+msgstr "选项"
+
+msgid "These apply while train mode is on."
+msgstr "以下选项仅在高铁模式开启时生效。"
+
+msgid "High-speed-rail setting (5G)"
+msgstr "高铁优化（5G）"
+
+msgid "4G only avoids constant 5G handovers on routes where 5G keeps dropping. It uses the Network locks setting and puts back the previous mode when it is turned off."
+msgstr "在 5G 频繁掉线的线路上，仅 4G 可避免反复切换 5G 小区。此选项使用“网络锁定”设置，关闭后会恢复之前的网络模式。"
+
+msgid "Recent events"
+msgstr "最近事件"
+
+msgid "Nothing yet"
+msgstr "暂无"
+
+msgid "Failed: %s"
+msgstr "失败：%s"
+
+msgid "Saved, applying..."
+msgstr "已保存，正在应用…"
+
+msgid "Management connection lost"
+msgstr "管理连接已中断"
