@@ -39,8 +39,8 @@ msgstr "5G NSA"
 msgid "(set by train mode, was %s)"
 msgstr "（由高铁模式设置，原为%s）"
 
-msgid "Running, checks every %d s"
-msgstr "运行中，每 %d 秒检查一次"
+msgid "Running: reacts to the modem at once, backup check every %d s"
+msgstr "运行中：即时响应调制解调器事件，每 %d 秒备用检查一次"
 
 msgid "Not running"
 msgstr "未运行"
@@ -86,3 +86,15 @@ msgstr "已保存，正在应用…"
 
 msgid "Management connection lost"
 msgstr "管理连接已中断"
+
+msgid "Backup check"
+msgstr "备用检查"
+
+msgid "Every %d s"
+msgstr "每 %d 秒"
+
+msgid "Saved"
+msgstr "已保存"
+
+msgid "A dropped connection is redialled the moment the modem announces it. The backup check catches what is never announced, such as a modem that stopped answering. Each check sends a few AT commands that other pages have to wait for, so shorter is not better."
+msgstr "调制解调器一报告断线就会立即重拨。备用检查用于发现不会被报告的情况，例如调制解调器停止响应。每次检查都会发送几条 AT 命令，其他页面需要排队等待，因此间隔并非越短越好。"

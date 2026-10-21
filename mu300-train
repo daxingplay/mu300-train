@@ -4,12 +4,13 @@
 #   mu300-train on | off      switch train mode
 #   mu300-train lte on|off    4G only while train mode is on (default off)
 #   mu300-train hsr on|off    the modem's HSR setting while train mode is on (default on)
+#   mu300-train interval N    the backup check, every 5|10|15|30|60 s (default 15)
 #   mu300-train status [N]    what is on, the modem's state, the loop, its last N events (events.log)
 #   mu300-train install       put the command and the LuCI page in place, create the config, add the rc.local line
 #   mu300-train uninstall     train mode off, and undo install (the files in /etc/mu300/train stay)
 #   mu300-train boot          (rc.local) re-install the links and the LuCI page, then sync
 #   mu300-train sync          bring the modem and the loop in line with the config (what on/off/lte/hsr end with)
-#   mu300-train ui KEY VALUE  (LuCI) set enabled|lte_only|hsr to 0|1 and sync in the background
+#   mu300-train ui KEY VALUE  (LuCI) set enabled|lte_only|hsr to 0|1 and sync in the background, or interval
 #   mu300-train json          the state as JSON (LuCI)
 #   mu300-train daemon        the fast reconnect loop itself (started by sync)
 #
@@ -24,11 +25,14 @@
 # the lock in between (then theirs stays).
 #
 # The loop: the stock watchdog (mobile-data watch) looks every 30 s and redials after two bad looks, and a drop costs
-# a minute or more before the dial even starts. On a train the bearer drops many times an hour. This loop looks every
-# few seconds and redials (ifup wan, the same path the watchdog takes) as soon as the modem is registered again. It
-# never dials while a dial runs, while the data is switched off by hand or while mu300-power holds the modem down, and
-# it backs off when dials keep failing. The stock watchdog keeps running underneath.
-# Measured 2026-10-21 (AT+CGACT=0,1 while registered): back in 13-17 s, against 68 s with the stock watchdog alone.
+# a minute or more before the dial even starts. On a train the bearer drops many times an hour. This loop follows what
+# the modem announces (+CGEV PDN DEACT the moment the context drops, +CEREG when the registration comes back) and
+# redials (ifup wan, the same path the watchdog takes) at once; a check every 15 s (interval) is the backup. It never
+# dials while a dial runs, while the data is switched off by hand or while mu300-power holds the modem down, and it
+# backs off when dials keep failing. The stock watchdog keeps running underneath.
+# Measured 2026-10-21 (AT+CGACT=0,1 while registered): 68 s with the stock watchdog alone, 13-17 s with a 5 s poll.
+# What is left is the dial itself: every AT command costs about a second on OpenWrt (mu300-atd's drain waits whole
+# seconds there, because OpenWrt's busybox ash has no fractional read -t), and a dial takes about ten of them.
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
 HOME_DIR=/etc/mu300/train
 SELF=$HOME_DIR/mu300-train
@@ -209,45 +213,119 @@ registered() {  # +CEREG: <n>,<stat>: 1 home, 5 roaming
 # starts close together, or a loop left over from an upgrade, never leave two loops dialling
 own_pidfile() { [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; }
 
+# What the modem announces: mu300-atd's drainer appends every unsolicited line from nr0 to this log (the same
+# source mu300cell-v6.sh follows). +CGEV ... PDN DEACT <cid> comes the instant the network or the modem drops the data
+# context, +CGEV ... PDN ACT <cid> when one comes up, +CEREG: <stat>[,...] (no <n> in the unsolicited form) when the
+# registration changes.
+URCLOG=/run/mu300-at/urc/stty_nr0.log
+EVFIFO=/run/mu300-train.urc
+CR=$(printf '\r')
+
+# start_watch: follow the URC log into the fifo on fd 4 (reads from it wake the loop at once); sets $watcher
+start_watch() {
+    [ -n "${watcher:-}" ] && kill "$watcher" 2>/dev/null
+    [ -p "$EVFIFO" ] || { rm -f "$EVFIFO"; mkfifo -m 600 "$EVFIFO"; }
+    exec 4<>"$EVFIFO"
+    # "-F -n 0", not "-n 0 -F": on every wan bring-up mu300cell-v6.sh kills each process whose ps line contains
+    # "tail -n 0 -F <this log>" (its reap of a stale monitor of its own), and this follower died with every redial
+    tail -F -n 0 "$URCLOG" >&4 2>/dev/null </dev/null &
+    watcher=$!
+}
+
+# the redial, as the stock watchdog does it; dials that keep failing while registered wait 10, 20, 40, 60 s apart
+redial() {
+    now=$(cut -d. -f1 /proc/uptime)
+    [ "$now" -lt "$next_dial" ] && return 0
+    log "redialling (ifup $WAN): $1"
+    ifup "$WAN"
+    # the dial needs the lock first; give it a moment so the next look sees it busy
+    sleep 2
+    if [ "$backoff" = 0 ]; then backoff=10; else backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60; fi
+    next_dial=$((now + backoff))
+}
+
+lost() {  # lost WHY: the data is gone
+    [ "$state" = ok ] && { down_since=$(cut -d. -f1 /proc/uptime); log "data lost ($1)"; }
+}
+
+back() {
+    [ "$state" != ok ] && log "data back after $(( $(cut -d. -f1 /proc/uptime) - down_since )) s"
+    state=ok backoff=0 next_dial=0
+}
+
+# look: the full check (the backup poll, and after an announcement that something may have come back)
+look() {
+    if bearer_ok; then back; return; fi
+    lost "check"
+    if ! registered; then
+        [ "$state" != searching ] && log "no service, waiting for the modem to register"
+        state=searching
+        return
+    fi
+    state=dialling
+    redial "registered without data"
+}
+
+# The loop. Announcements from the modem drive it: a dropped context is redialled the moment it is announced (one AT
+# command to see the modem is registered), and a registration that comes back after a gap redials at once. The poll
+# every `interval` seconds (default 15) is the backup for what is never announced: a modem that went quiet, a lost
+# announcement, a re-attach to a new address that sipa_eth0 does not have yet.
 daemon() {
     echo $$ > "$PIDFILE"
-    trap 'own_pidfile && rm -f "$PIDFILE"; exit 0' INT TERM
-    interval=$(cfg interval 5)
-    backoff=0 next_dial=0 state=ok down_since=
-    log "fast reconnect loop started (every ${interval} s)"
+    watcher=
+    trap 'kill $watcher 2>/dev/null; own_pidfile && rm -f "$PIDFILE"; exit 0' INT TERM
+    backoff=0 next_dial=0 state=ok down_since= unreg=0
+    start_watch
+    next_poll=$(( $(cut -d. -f1 /proc/uptime) + $(cfg interval 15) ))
+    log "fast reconnect loop started (modem announcements, backup check every $(cfg interval 15) s)"
     while :; do
-        sleep "$interval"
-        own_pidfile || { log "another loop took over, this one ends"; exit 0; }
+        now=$(cut -d. -f1 /proc/uptime)
+        # while the data is down, look every 2 s: the "context active" announcement arrives while the dial still
+        # runs and is skipped, and a failed dial announces nothing at all
+        [ "$state" != ok ] && [ "$next_poll" -gt $((now + 2)) ] && next_poll=$((now + 2))
+        w=$((next_poll - now)); [ "$w" -lt 1 ] && w=1
+        ev=poll
+        if IFS= read -r -t "$w" line <&4; then
+            line=${line%"$CR"}
+            case $line in
+                *"PDN DEACT $CID"|*"PDN DEACT $CID,"*|*"PDN DEACT $CID "*) ev=deact ;;
+                *"PDN ACT $CID"|*"PDN ACT $CID,"*|*"PDN ACT $CID "*) ev=act ;;
+                "+CEREG: 1"|"+CEREG: 1,"*|"+CEREG: 5"|"+CEREG: 5,"*) ev=reg ;;
+                # not registered (0 none, 2 searching, 3 denied, 4 unknown): remember it, nothing to do yet
+                "+CEREG: "[0234]|"+CEREG: "[0234],*) unreg=1; continue ;;
+                *) continue ;;   # anything else: back to waiting, the poll keeps its time
+            esac
+        fi
+        own_pidfile || { log "another loop took over, this one ends"; kill "$watcher" 2>/dev/null; exit 0; }
         [ "$(cfg enabled 0)" = 1 ] || { log "train mode is off, loop ends"; break; }
+        if [ "$ev" = poll ]; then
+            next_poll=$(( $(cut -d. -f1 /proc/uptime) + $(cfg interval 15) ))
+            # the follower is gone (killed, or the log's directory was replaced): start it again
+            kill -0 "$watcher" 2>/dev/null || { log "URC follower restarted"; start_watch; }
+        fi
         [ -e /run/mu300-mobile-data-down ] && continue        # data switched off by hand
         [ -s /run/mu300-mobile-data.suspend ] && continue     # mu300-power holds the modem down
         [ -p /run/mu300-at/cmd ] || continue
         sync_busy && continue                                 # a mode or HSR change restarts the radio on purpose
+        [ -d /run/unisoc-modem-lock-apply ] && continue       # so does a Network locks change (it redials itself)
+        # a dial is running: the teardown and bring-up it announces itself are not news
         dial_busy && continue
-        if bearer_ok; then
-            if [ "$state" != ok ]; then
-                log "data back after $(( $(cut -d. -f1 /proc/uptime) - down_since )) s"
-            fi
-            state=ok backoff=0 next_dial=0
-            continue
-        fi
-        now=$(cut -d. -f1 /proc/uptime)
-        [ "$state" = ok ] && { down_since=$now; log "data lost"; }
-        if ! registered; then
-            [ "$state" != searching ] && log "no service, waiting for the modem to register"
-            state=searching
-            continue
-        fi
-        state=dialling
-        [ "$now" -lt "$next_dial" ] && continue
-        log "registered without data, redialling (ifup $WAN)"
-        ifup "$WAN"
-        # the dial needs the lock first; give it a moment so the next round sees it busy
-        sleep 2
-        # dials that keep failing while registered: 10, 20, 40, 60 s apart
-        if [ "$backoff" = 0 ]; then backoff=10; else backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60; fi
-        next_dial=$((now + backoff))
+        case $ev in
+            deact)
+                lost "the modem announced it"
+                if registered; then state=dialling; redial "announced drop"
+                else [ "$state" != searching ] && log "no service, waiting for the modem to register"; state=searching
+                fi ;;
+            reg)
+                # registered again after a gap: if the data went with it, this is the moment a dial can work. A
+                # +CEREG that only reports a new cell (every handover, on a train) is not worth a check.
+                if [ "$unreg" = 1 ] || [ "$state" != ok ]; then unreg=0; look; fi ;;
+            act)
+                [ "$state" != ok ] && look ;;
+            poll) look ;;
+        esac
     done
+    kill "$watcher" 2>/dev/null
     own_pidfile && rm -f "$PIDFILE"
 }
 
@@ -261,7 +339,7 @@ status() {
     echo "modem HSR:    ${h:-no answer}"
     m=$(mode_now)
     echo "network mode: ${m:-no answer}$([ "$(cfg mode_owned 0)" = 1 ] && echo " (set by train mode, was $(cfg prev_mode auto))")"
-    if p=$(daemon_pid); then echo "fast loop:    running (pid $p, every $(cfg interval 5) s)"; else echo "fast loop:    not running"; fi
+    if p=$(daemon_pid); then echo "fast loop:    running (pid $p): modem announcements, backup check every $(cfg interval 15) s"; else echo "fast loop:    not running"; fi
     echo "network:      $(at 'AT+CEREG?' 4 | grep '^+CEREG')"
     echo "wan:          $(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}')"
     echo "last events:"
@@ -278,12 +356,22 @@ json() {  # for LuCI; no AT queries while a sync holds the radio (they would wai
         "$([ "$(cfg hsr 1)" = 1 ] && echo true || echo false)" \
         "$([ "$(cfg lte_only 0)" = 1 ] && echo true || echo false)" \
         "$busy" "$loop" "$h" "$m" \
-        "$([ "$(cfg mode_owned 0)" = 1 ] && echo true || echo false)" "$(cfg prev_mode '')" "$(cfg interval 5)"
+        "$([ "$(cfg mode_owned 0)" = 1 ] && echo true || echo false)" "$(cfg prev_mode '')" "$(cfg interval 15)"
     tail -n 30 "$EVENTS" 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g; s/.*/"&"/' | tr '\n' ',' | sed 's/,$//'
     printf ']}\n'
 }
 
-ui() {  # ui KEY 0|1: the LuCI page's setter; answers at once, the change runs in the background
+INTERVALS="5 10 15 30 60"   # the backup check's choices (seconds)
+
+ui() {  # ui KEY VALUE: the LuCI page's setter; answers at once, the change runs in the background
+    if [ "$1" = interval ]; then
+        # the loop reads it at its next check: no sync, no radio restart
+        case " $INTERVALS " in *" $2 "*) ;; *) echo '{"ok":0,"error":"bad value"}'; return 2 ;; esac
+        cfg_set interval "$2"
+        log "LuCI: interval -> $2"
+        echo '{"ok":1}'
+        return 0
+    fi
     case $1 in enabled|lte_only|hsr) ;; *) echo '{"ok":0,"error":"unknown setting"}'; return 2 ;; esac
     case $2 in 0|1) ;; *) echo '{"ok":0,"error":"bad value"}'; return 2 ;; esac
     cfg_set "$1" "$2"
@@ -329,7 +417,7 @@ install_it() {
         uci -q set mu300train.main.enabled=0
         uci -q set mu300train.main.hsr=1
         uci -q set mu300train.main.lte_only=0
-        uci -q set mu300train.main.interval=5
+        uci -q set mu300train.main.interval=15
         uci commit mu300train
     }
     [ -n "$(uci -q get mu300train.main.lte_only)" ] || cfg_set lte_only 0
@@ -373,6 +461,9 @@ case ${1:-status} in
         key=$1; [ "$key" = lte ] && key=lte_only
         case ${2:-} in on) cfg_set "$key" 1 ;; off) cfg_set "$key" 0 ;; *) echo "usage: mu300-train $1 on|off" >&2; exit 2 ;; esac
         do_sync; say "$1 $2 (applies while train mode is on)" ;;
+    interval)
+        case " $INTERVALS " in *" ${2:-} "*) ;; *) echo "usage: mu300-train interval 5|10|15|30|60" >&2; exit 2 ;; esac
+        cfg_set interval "$2"; say "backup check every $2 s (from the next check)" ;;
     status) status "${2:-10}" ;;
     sync) do_sync ;;
     ui) ui "${2:-}" "${3:-}" ;;
@@ -381,5 +472,5 @@ case ${1:-status} in
     uninstall) uninstall_it ;;
     boot) boot ;;
     daemon) daemon ;;
-    *) echo "usage: mu300-train on|off | lte on|off | hsr on|off | status [N] | install | uninstall" >&2; exit 2 ;;
+    *) echo "usage: mu300-train on|off | lte on|off | hsr on|off | interval SECONDS | status [N] | install | uninstall" >&2; exit 2 ;;
 esac

@@ -9,8 +9,9 @@ either. This add-on brings the same idea to OpenWrt:
 
 - **Modem HSR setting:** turns on the Unisoc modem's own high-speed-rail optimisation, the switch Unisoc's EngineerMode
   app offers in the stock Android firmware.
-- **Fast reconnect:** checks the mobile data connection every 5 s and redials as soon as the modem is registered again.
-  The stock mu300-linux watchdog checks every 30 s and waits for two failures before it redials.
+- **Fast reconnect:** redials the moment the modem announces that the data connection dropped, or that it found the
+  network again, with a backup check every 15 s (configurable). The stock mu300-linux watchdog checks every 30 s and
+  waits for two failures before it redials.
 - **4G only (optional):** avoids constant 5G handovers on routes where 5G keeps dropping.
 - **LuCI page** at *Cellular → Train mode*, in English and Simplified Chinese.
 
@@ -24,7 +25,11 @@ a handover or a tunnel.
 | | Data back after |
 |---|---|
 | mu300-linux watchdog only | 68 s |
-| with mu300-train | 13–17 s (4 runs) |
+| mu300-train 0.1 (polling every 5 s) | 13–17 s (4 runs) |
+| mu300-train, reacting to the modem's announcements | 11.7–13.8 s (5 runs) |
+
+The drop is noticed and the redial started within about 2 s. The rest is mu300-linux's own dial: every AT command on
+OpenWrt costs about a second (mu300-atd waits whole seconds there), and a dial needs about ten of them.
 
 The fast reconnect was measured on a desk. The HSR setting itself (Doppler handling at 300 km/h) can only be judged
 on a real train; reports are welcome.
@@ -58,6 +63,7 @@ mu300-train on          # train mode on: HSR + fast reconnect (+ 4G only, if cho
 mu300-train off         # everything back as it was
 mu300-train lte on|off  # 4G only while train mode is on (default off)
 mu300-train hsr on|off  # the modem HSR setting while train mode is on (default on)
+mu300-train interval 15 # the backup check: 5, 10, 15, 30 or 60 s (default 15; takes effect at once)
 mu300-train status 30   # state + the last 30 events
 ```
 
@@ -78,9 +84,17 @@ AT+SP5GCMDS="get nr synch_param",44 # read back: the 4th field is the value
 It is an NR (5G) parameter, so it does nothing on 4G. The modem keeps the value across radio restarts and reboots.
 mu300-train sends it through mu300-linux's `mu300-at`, never by opening the modem's AT port directly.
 
-**Fast reconnect.** A loop checks every 5 s that the data context is active and that `sipa_eth0` carries the
-context's current address. When it isn't, and the modem is registered, it runs `ifup wan`, the same dial path the
-stock watchdog uses. It never dials while another dial is running, while mobile data is switched off by hand or while
+**Fast reconnect.** The modem announces changes on its unsolicited channel, which mu300-linux logs to
+`/run/mu300-at/urc/stty_nr0.log`. mu300-train follows that log. `+CGEV: NW PDN DEACT 1` / `ME PDN DEACT 1` (the data
+context dropped) triggers a redial at once if the modem is registered. A `+CEREG` that reports registration after a
+gap triggers a check, because that's when a dial can work. A backup check every 15 s covers what is never announced:
+a modem that stopped answering, a missed announcement, a re-attach to a new address. It verifies that the context is
+active and that `sipa_eth0` carries its current address. While the data is down it checks every 2 s.
+
+Each check sends two or three AT commands, and other users of the AT channel (the LuCI dashboard, SMS) wait behind
+them. That's why the backup check isn't very frequent: with the announcements it only has to catch rare cases.
+
+The redial is `ifup wan`, the same dial path the stock watchdog uses. It never dials while another dial is running, while mobile data is switched off by hand or while
 mu300-power holds the modem down. It backs off (10, 20, 40, 60 s) when dials keep failing. The stock watchdog keeps
 running underneath.
 
@@ -93,7 +107,7 @@ or train mode goes off, unless you changed the network lock by hand in the meant
 | Path | What |
 |---|---|
 | `/etc/mu300/train/` | the script, the LuCI sources, `events.log` |
-| `/etc/config/mu300train` | settings (`enabled`, `hsr`, `lte_only`, `interval`) |
+| `/etc/config/mu300train` | settings (`enabled`, `hsr`, `lte_only`, `interval` of the backup check) |
 | `/etc/rc.local` | one line that runs `mu300-train boot` |
 | `/usr/bin/mu300-train` | link to the script |
 | `/www/luci-static/resources/view/mu300/train.js`, `/usr/share/luci/menu.d/luci-app-mu300-train.json`, `/usr/share/rpcd/acl.d/luci-app-mu300-train.json`, `/usr/libexec/rpcd/mu300train`, `/usr/lib/lua/luci/i18n/mu300train.zh-cn.lmo` | the LuCI page |
