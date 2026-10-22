@@ -12,10 +12,13 @@ either. This add-on brings the same idea to OpenWrt:
 - **Fast reconnect:** redials the moment the modem announces that the data connection dropped, or that it found the
   network again, with a backup check every 15 s (configurable). The stock mu300-linux watchdog checks every 30 s and
   waits for two failures before it redials.
+- **Fast AT:** makes every AT command about 8× faster (1.04 s → 0.13 s) by running mu300-linux's AT daemon under a
+  shell that can wait fractions of a second. That's most of what's left of an outage after a drop. On by default.
 - **4G only (optional):** avoids constant 5G handovers on routes where 5G keeps dropping.
 - **LuCI page** at *Cellular → Train mode*, in English and Simplified Chinese.
 
-It is a standalone add-on: mu300-linux itself is not patched, and an mu300-linux update keeps it working.
+It is a standalone add-on: mu300-linux's programs are not patched, and an mu300-linux update keeps it working. The one
+change it makes outside its own files is Fast AT's start line in two of mu300-linux's init scripts (see below).
 
 ## Measured
 
@@ -27,9 +30,10 @@ a handover or a tunnel.
 | mu300-linux watchdog only | 68 s |
 | mu300-train, first version (polling every 5 s, never released) | 13–17 s (4 runs) |
 | mu300-train v0.1.0 (reacts to the modem's announcements) | 11.7–13.8 s (5 runs) |
+| mu300-train with Fast AT | **2.7–3.8 s** (5 runs) |
 
-The drop is noticed and the redial started within about 2 s. The rest is mu300-linux's own dial: every AT command on
-OpenWrt costs about a second (mu300-atd waits whole seconds there), and a dial needs about ten of them.
+Without Fast AT, the drop is noticed and the redial started within about 2 s, and the rest is mu300-linux's own dial:
+about ten AT commands at about a second each. Fast AT brings that dial down to about 2 s.
 
 The fast reconnect was measured on a desk. The HSR setting itself (Doppler handling at 300 km/h) can only be judged
 on a real train; reports are welcome.
@@ -64,6 +68,7 @@ mu300-train off         # everything back as it was
 mu300-train lte on|off  # 4G only while train mode is on (default off)
 mu300-train hsr on|off  # the modem HSR setting while train mode is on (default on)
 mu300-train interval 15 # the backup check: 5, 10, 15, 30 or 60 s (default 15; takes effect at once)
+mu300-train fast-at on|off # Fast AT (default on; works whether train mode is on or off)
 mu300-train status 30   # state + the last 30 events
 ```
 
@@ -98,6 +103,16 @@ The redial is `ifup wan`, the same dial path the stock watchdog uses. It never d
 mu300-power holds the modem down. It backs off (10, 20, 40, 60 s) when dials keep failing. The stock watchdog keeps
 running underneath.
 
+**Fast AT.** mu300-linux's AT daemon (`mu300-atd`) waits for stray lines before every command: 0.1 s where the shell
+can wait fractions of a second, a whole second where it can't. OpenWrt's busybox `ash` can't (`read: invalid
+timeout`), so every AT command costs about a second. The static busybox that mu300-linux ships in `/opt/mu300/bin`
+can. Fast AT changes the daemons' start lines in `/etc/init.d/mu300-atd` (the general and mobile-data channels) and
+`/etc/init.d/mu300-atd-dash` (the LuCI dashboard's channels) to `/opt/mu300/bin/busybox ash /opt/mu300/bin/mu300-atd`,
+and restarts those daemons once the data is up. Nothing else in the scripts changes, and `fast-at off` or
+`uninstall` puts the stock lines back. An mu300-linux update replaces the scripts, so at every boot mu300-train
+applies it again. Measured: 200 commands on two channels at the same time got 0 mixed-up replies. See
+[#4](https://github.com/daxingplay/mu300-train/issues/4); the real fix belongs in mu300-linux.
+
 **4G only** is set through mu300-linux's own network lock (`/usr/libexec/unisoc-modem/lock apply mode 4g`), so
 *Cellular → Network locks* shows it and it survives reboots. The previous mode is remembered and restored when 4G only
 or train mode goes off, unless you changed the network lock by hand in the meantime.
@@ -109,16 +124,18 @@ or train mode goes off, unless you changed the network lock by hand in the meant
 | `/etc/mu300/train/` | the script, the LuCI sources, `events.log` |
 | `/etc/config/mu300train` | settings (`enabled`, `hsr`, `lte_only`, `interval` of the backup check) |
 | `/etc/rc.local` | one line that runs `mu300-train boot` |
+| `/etc/init.d/mu300-atd`, `/etc/init.d/mu300-atd-dash` | Fast AT: the daemons' start lines (mu300-linux's files) |
 | `/usr/bin/mu300-train` | link to the script |
 | `/www/luci-static/resources/view/mu300/train.js`, `/usr/share/luci/menu.d/luci-app-mu300-train.json`, `/usr/share/rpcd/acl.d/luci-app-mu300-train.json`, `/usr/libexec/rpcd/mu300train`, `/usr/lib/lua/luci/i18n/mu300train.zh-cn.lmo` | the LuCI page |
 
 An mu300-linux update keeps only `/etc/config`, `/etc/mu300`, `/etc/rc.local`, `/etc/dropbear` and `/root`. So
-everything lives in those, and at every boot `mu300-train boot` puts the link and the LuCI files back in place.
+everything lives in those, and at every boot `mu300-train boot` puts the link, the LuCI files and Fast AT back in
+place.
 
 ## Uninstall
 
 ```sh
-mu300-train uninstall      # train mode off, LuCI page, link, config and rc.local line removed
+mu300-train uninstall      # train mode off, Fast AT off, LuCI page, link, config and rc.local line removed
 rm -rf /etc/mu300/train    # the files themselves
 ```
 
