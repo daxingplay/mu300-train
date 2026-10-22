@@ -5,10 +5,11 @@
 #   mu300-train lte on|off    4G only while train mode is on (default off)
 #   mu300-train hsr on|off    the modem's HSR setting while train mode is on (default on)
 #   mu300-train interval N    the backup check, every 5|10|15|30|60 s (default 15)
+#   mu300-train fast-at on|off run mu300-linux's AT daemons under the static busybox ash (default on; see Fast AT)
 #   mu300-train status [N]    what is on, the modem's state, the loop, its last N events (events.log)
 #   mu300-train install       put the command and the LuCI page in place, create the config, add the rc.local line
 #   mu300-train uninstall     train mode off, and undo install (the files in /etc/mu300/train stay)
-#   mu300-train boot          (rc.local) re-install the links and the LuCI page, then sync
+#   mu300-train boot          (rc.local) re-install the links, the LuCI page and Fast AT, then sync
 #   mu300-train sync          bring the modem and the loop in line with the config (what on/off/lte/hsr end with)
 #   mu300-train ui KEY VALUE  (LuCI) set enabled|lte_only|hsr to 0|1 and sync in the background, or interval
 #   mu300-train json          the state as JSON (LuCI)
@@ -30,9 +31,16 @@
 # redials (ifup wan, the same path the watchdog takes) at once; a check every 15 s (interval) is the backup. It never
 # dials while a dial runs, while the data is switched off by hand or while mu300-power holds the modem down, and it
 # backs off when dials keep failing. The stock watchdog keeps running underneath.
-# Measured 2026-10-21 (AT+CGACT=0,1 while registered): 68 s with the stock watchdog alone, 13-17 s with a 5 s poll.
-# What is left is the dial itself: every AT command costs about a second on OpenWrt (mu300-atd's drain waits whole
-# seconds there, because OpenWrt's busybox ash has no fractional read -t), and a dial takes about ten of them.
+# Measured 2026-10-21 (AT+CGACT=0,1 while registered): 68 s with the stock watchdog alone, 13-17 s with a 5 s poll,
+# 11.7-13.8 s with the announcements. What is left is the dial itself, about ten AT commands: see Fast AT.
+#
+# Fast AT: mu300-atd waits for stray lines before every command, 0.1 s where the shell's read -t takes fractions and
+# a whole second where it does not - and OpenWrt's busybox ash does not ("read: invalid timeout"). So every AT command
+# costs about a second, and a dial about ten. The static busybox that mu300-linux ships in /opt/mu300/bin takes
+# fractions. Fast AT changes the daemons' start lines in /etc/init.d/mu300-atd and mu300-atd-dash to run mu300-atd
+# under it. Measured 2026-10-22: 1.04 s -> 0.13 s per command, data back 3.3-3.8 s after a drop instead of 11.7-13.8 s,
+# 0 mixed-up replies in 200 commands on two channels at once. An mu300-linux update puts the stock init scripts back,
+# so boot applies it again. A restarted daemon reopens its SIPC tty; that reopened cleanly every time it was tried.
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/mu300/bin:/opt/mu300/busybox-bin"
 HOME_DIR=/etc/mu300/train
 SELF=$HOME_DIR/mu300-train
@@ -109,6 +117,16 @@ mode_apply() {  # through the panel's lock tool: it saves the lock, restarts the
     [ -x "$LOCKTOOL" ] || { say "no $LOCKTOOL, cannot set the network mode"; return 1; }
     "$LOCKTOOL" apply mode "$1" >/dev/null 2>&1 || { say "network mode $1 failed"; return 1; }
     say "network mode set to $1"
+}
+
+# the modem answers its NR commands only once the stack is up: at boot rc.local runs ~20 s after power-on and the
+# first answer comes after the RIL handshake at ~35 s, so do_sync's HSR query timed out on every boot (measured)
+wait_modem() {  # wait_modem SECONDS
+    end=$(( $(cut -d. -f1 /proc/uptime) + $1 ))
+    until [ -n "$(hsr_get)" ]; do
+        [ "$(cut -d. -f1 /proc/uptime)" -ge "$end" ] && return 1
+        sleep 5
+    done
 }
 
 radio_restart() {
@@ -189,6 +207,50 @@ do_sync() {
     rm -rf "$SYNCLOCK"; trap - EXIT
 }
 
+BB=/opt/mu300/bin/busybox
+ATD=/opt/mu300/bin/mu300-atd
+ATD_INITS="/etc/init.d/mu300-atd /etc/init.d/mu300-atd-dash"
+
+fast_at_needed() {  # /bin/sh rejects a fractional read -t, and the static busybox ash takes it
+    [ -n "$(/bin/sh -c 'read -t 0.1 _x </dev/null' 2>&1)" ] || return 1
+    [ -x "$BB" ] && [ -z "$("$BB" ash -c 'read -t 0.1 _x </dev/null' 2>&1)" ]
+}
+
+fast_at_on() {  # the init scripts start mu300-atd under the static busybox ash
+    grep -qF "$BB ash $ATD)" /etc/init.d/mu300-atd 2>/dev/null
+}
+
+# fast_at_set 1|0: rewrite the daemons' start lines, and restart the services whose script changed (procd restarts
+# only the instances whose command changed). A line that no longer looks like mu300-linux's is left alone.
+fast_at_set() {
+    for f in $ATD_INITS; do
+        [ -f "$f" ] || continue
+        if [ "$1" = 1 ]; then
+            sed "/wait_and_exec \/dev\/stty_nr/{ /busybox ash/! s# $ATD)# $BB ash $ATD)#; }" "$f" > /tmp/mu300-train.initd
+        else
+            sed "s# $BB ash $ATD)# $ATD)#" "$f" > /tmp/mu300-train.initd
+        fi
+        if cmp -s "$f" /tmp/mu300-train.initd; then rm -f /tmp/mu300-train.initd; continue; fi
+        cat /tmp/mu300-train.initd > "$f"; rm -f /tmp/mu300-train.initd   # cat, not mv: the script keeps its mode
+        # not before the data is up: a dial's commands would fail with the daemon gone. At most 180 s, and not
+        # while the data is off on purpose. After a wait, 5 s more for the operator query mobile-data sends after
+        # the dial in the background (cut off by a restart, it hung for 30 s, measured).
+        n=0
+        while { dial_busy || ! wan_up; } && [ "$n" -lt 180 ] &&
+            [ ! -e /run/mu300-mobile-data-down ] && [ ! -s /run/mu300-mobile-data.suspend ]; do
+            sleep 1; n=$((n + 1))
+        done
+        [ "$n" -gt 0 ] && sleep 5
+        # restart only a service that runs (a start would also start one that is disabled)
+        ubus call service list "{\"name\":\"${f##*/}\"}" 2>/dev/null | grep -q '"running": true' && "$f" start
+        say "${f##*/}: AT daemons $([ "$1" = 1 ] && echo "now run under $BB ash" || echo "back to /bin/sh")"
+    done
+}
+
+fast_at_apply() {  # what the setting asks for
+    if [ "$(cfg fast_at 1)" = 1 ]; then fast_at_needed && fast_at_set 1; else fast_at_set 0; fi
+}
+
 # A dial is running: mobile-data up holds its lock (a symlink to the owner's pid), or netifd has the WAN pending
 dial_busy() {
     o=$(readlink "$UPLOCK" 2>/dev/null) && [ -n "$o" ] && [ -d "/proc/$o" ] && return 0
@@ -204,6 +266,8 @@ bearer_ok() {
     want=$(at "AT+CGPADDR=$CID" 4 | awk -F'[ ,"]+' '/^\+CGPADDR:/ { if (split($3, o, ".") == 4 && $3 != "0.0.0.0") print $3; exit }')
     [ -z "$want" ] || [ "$want" = "$have" ]
 }
+
+wan_up() { [ "$(ifstatus "$WAN" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = true ]; }
 
 registered() {  # +CEREG: <n>,<stat>: 1 home, 5 roaming
     at 'AT+CEREG?' 4 | grep -qE '^\+CEREG: *[0-9],(1|5)'
@@ -334,7 +398,11 @@ onoff() { [ "$1" = 1 ] && echo on || echo off; }
 status() {
     en=$(cfg enabled 0)
     echo "train mode:   $(onoff "$en")$(sync_busy && echo ' (applying a change)')"
-    echo "options:      HSR $(onoff "$(cfg hsr 1)"), 4G only $(onoff "$(cfg lte_only 0)")"
+    echo "options:      HSR $(onoff "$(cfg hsr 1)"), 4G only $(onoff "$(cfg lte_only 0)"), Fast AT $(onoff "$(cfg fast_at 1)")"
+    if fast_at_on; then echo "AT daemons:   static busybox ash (fast)"
+    elif fast_at_needed; then echo "AT daemons:   /bin/sh (about 1 s per command)"
+    else echo "AT daemons:   /bin/sh (takes fractional timeouts, fast already)"
+    fi
     h=$(hsr_get)
     echo "modem HSR:    ${h:-no answer}"
     m=$(mode_now)
@@ -418,11 +486,13 @@ install_it() {
         uci -q set mu300train.main.hsr=1
         uci -q set mu300train.main.lte_only=0
         uci -q set mu300train.main.interval=15
+        uci -q set mu300train.main.fast_at=1
         uci commit mu300train
     }
     [ -n "$(uci -q get mu300train.main.lte_only)" ] || cfg_set lte_only 0
     ln -sfn "$SELF" "$LINK"
     install_luci
+    fast_at_apply
     if ! grep -qF "$SELF boot" /etc/rc.local; then
         # before the final exit 0
         awk -v l="$RCLINE" '/^exit 0/ && !d { print l; d = 1 } { print } END { if (!d) print l }' /etc/rc.local > /etc/rc.local.new &&
@@ -440,6 +510,7 @@ uninstall_it() {
     cfg_set enabled 0
     do_sync
     remove_luci
+    fast_at_set 0
     grep -vF "$SELF boot" /etc/rc.local > /etc/rc.local.new && cat /etc/rc.local.new > /etc/rc.local && rm -f /etc/rc.local.new
     [ -L "$LINK" ] && rm -f "$LINK"
     rm -f /etc/config/mu300train
@@ -449,8 +520,10 @@ uninstall_it() {
 boot() {
     ln -sfn "$SELF" "$LINK"   # /usr/bin is replaced by an update
     install_luci
+    fast_at_apply             # and /etc/init.d
     [ "$(cfg enabled 0)" = 1 ] || exit 0
     wait_at 180 || { log "boot: no AT daemon after 180 s"; exit 1; }
+    wait_modem 180 || log "boot: the modem did not answer for 180 s"
     # the modem keeps HSR and the lock tool replays 4G only, so this is normally a check that changes nothing
     do_sync
 }
@@ -464,6 +537,10 @@ case ${1:-status} in
     interval)
         case " $INTERVALS " in *" ${2:-} "*) ;; *) echo "usage: mu300-train interval 5|10|15|30|60" >&2; exit 2 ;; esac
         cfg_set interval "$2"; say "backup check every $2 s (from the next check)" ;;
+    fast-at)
+        case ${2:-} in on) cfg_set fast_at 1 ;; off) cfg_set fast_at 0 ;; *) echo "usage: mu300-train fast-at on|off" >&2; exit 2 ;; esac
+        if [ "$2" = on ] && ! fast_at_needed; then say "not needed here: /bin/sh takes fractional timeouts"; else fast_at_apply; fi
+        say "Fast AT $2" ;;
     status) status "${2:-10}" ;;
     sync) do_sync ;;
     ui) ui "${2:-}" "${3:-}" ;;
@@ -472,5 +549,5 @@ case ${1:-status} in
     uninstall) uninstall_it ;;
     boot) boot ;;
     daemon) daemon ;;
-    *) echo "usage: mu300-train on|off | lte on|off | hsr on|off | interval SECONDS | status [N] | install | uninstall" >&2; exit 2 ;;
+    *) echo "usage: mu300-train on|off | lte on|off | hsr on|off | interval SECONDS | fast-at on|off | status [N] | install | uninstall" >&2; exit 2 ;;
 esac
